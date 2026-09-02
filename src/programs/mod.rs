@@ -4,3 +4,4 @@ pub mod issuance_factory;
 pub mod lending;
 pub mod program;
 pub mod script_auth;
+pub mod swaption_lending;

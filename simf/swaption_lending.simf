@@ -1,0 +1,288 @@
+// Swaption lending v1 — a sale with a buyback right.
+//
+// The borrower has sold COLLATERAL_AMOUNT of COLLATERAL_ASSET_ID to the lender
+// and holds the right to buy it back for BUYBACK_AMOUNT of CASH_ASSET_ID at any
+// time before EXPIRY_HEIGHT (a fully collateralised American call). The coin
+// sits in this covenant; the roles are the two one-unit NFTs.
+//
+// State (one taproot storage slot): remaining_debt — cash still owed to buy
+// back what is left. Collateral remaining is a pure function of it.
+//
+// Paths:
+//   exercise(current_debt, amount)  borrower pays `amount` of cash to the
+//                                   lender's script and unlocks collateral
+//                                   proportionally; full when amount == debt
+//   lapse(current_debt)             after EXPIRY_HEIGHT the lender takes the
+//                                   remaining collateral
+//
+// Forked from BlockstreamResearch/simplicity-lending lending.simf
+// (MIT OR Apache-2.0). Removed: pending state, accept, cancel, vaults,
+// protocol fee. Fixed: remaining collateral is derived from cumulative paid
+// debt (the reference subtracts per-step floors, which drifts after two
+// partial repayments).
+
+// Helper getters
+
+fn get_script_hash(index: u32, is_input_index: bool) -> u256 {
+    let script_hash: u256 = match is_input_index {
+        true => unwrap(jet::input_script_hash(index)),
+        false => unwrap(jet::output_script_hash(index)),
+    };
+
+    script_hash
+}
+
+fn get_explicit_asset_and_amount(index: u32, is_input_index: bool) -> (u256, u64) {
+    let pair: (Asset1, Amount1) = match is_input_index {
+        true => unwrap(jet::input_amount(index)),
+        false => unwrap(jet::output_amount(index)),
+    };
+    let (asset, amount): (Asset1, Amount1) = pair;
+    let asset_bits: u256 = unwrap_right::<(u1, u256)>(asset);
+    let amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (asset_bits, amount)
+}
+
+fn is_op_return(output_index: u32) -> bool {
+    match jet::output_null_datum(output_index, 0) {
+        Some(entry: Option<Either<(u2, u256), Either<u1, u4>>>) => true,
+        None => false,
+    }
+}
+
+// Check helpers
+
+fn check_asset_amounts_eq(asset_amount_1: u64, asset_amount_2: u64) {
+    assert!(jet::eq_64(asset_amount_1, asset_amount_2));
+}
+
+fn check_assets_eq(asset_bits_1: u256, asset_bits_2: u256) {
+    assert!(jet::eq_256(asset_bits_1, asset_bits_2));
+}
+
+fn check_script_hashes_eq(script_1: u256, script_2: u256) {
+    assert!(jet::eq_256(script_1, script_2));
+}
+
+fn check_flags_eq(flag_1: bool, flag_2: bool) {
+    assert!(jet::eq_1(<bool>::into(flag_1), <bool>::into(flag_2)));
+}
+
+// Math helpers
+
+fn safe_sub_64(first: u64, second: u64) -> u64 {
+    let (carry, result): (bool, u64) = jet::subtract_64(first, second);
+
+    check_flags_eq(carry, false);
+
+    result
+}
+
+fn mul_div(x: u64, y: u64, denominator: u64) -> u64 {
+    let product: u128 = jet::multiply_64(x, y);
+
+    let (hi, lo): (u64, u64) = <u128>::into(product);
+    check_asset_amounts_eq(hi, 0);
+
+    let result: u64 = jet::divide_64(lo, denominator);
+
+    result
+}
+
+// Ensure functions
+
+fn ensure_output_is_op_return(index: u32) {
+    check_flags_eq(is_op_return(index), true);
+}
+
+fn ensure_input_script_hash(input_index: u32, expected_script_hash: u256) {
+    let script_hash: u256 = get_script_hash(input_index, true);
+
+    check_script_hashes_eq(script_hash, expected_script_hash);
+}
+
+fn ensure_output_script_hash(output_index: u32, expected_script_hash: u256) {
+    let script_hash: u256 = get_script_hash(output_index, false);
+
+    check_script_hashes_eq(script_hash, expected_script_hash);
+}
+
+fn ensure_input_asset_and_amount(input_index: u32, expected_asset_bits: u256, expected_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(input_index, true);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    check_asset_amounts_eq(amount, expected_amount);
+}
+
+fn ensure_output_asset_and_amount(output_index: u32, expected_asset_bits: u256, expected_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(output_index, false);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    check_asset_amounts_eq(amount, expected_amount);
+}
+
+fn ensure_io_asset_and_amount_eq(
+    input_index: u32,
+    output_index: u32,
+    expected_asset_bits: u256,
+    expected_amount: u64
+) {
+    ensure_input_asset_and_amount(input_index, expected_asset_bits, expected_amount);
+    ensure_output_asset_and_amount(output_index, expected_asset_bits, expected_amount);
+}
+
+fn ensure_input_asset_and_amount_burn(
+    input_index: u32,
+    output_index: u32,
+    expected_asset_bits: u256,
+    expected_asset_amount: u64
+) {
+    ensure_io_asset_and_amount_eq(input_index, output_index, expected_asset_bits, expected_asset_amount);
+
+    ensure_output_is_op_return(output_index);
+}
+
+// Storage: one slot, remaining_debt
+
+fn get_remaining_debt_slot_leaf(remaining_debt: u64) -> u256 {
+    let remaining_debt: u256 = <(u128, u128)>::into((0, <(u64, u64)>::into((0, remaining_debt))));
+
+    let state_ctx1: Ctx8 = jet::tapdata_init();
+    let state_ctx2: Ctx8 = jet::sha_256_ctx_8_add_32(state_ctx1, remaining_debt);
+
+    jet::sha_256_ctx_8_finalize(state_ctx2)
+}
+
+fn get_script_hash_for_storage(remaining_debt: u64) -> u256 {
+    let remaining_debt_slot_leaf: u256 = get_remaining_debt_slot_leaf(remaining_debt);
+
+    let tap_node: u256 = jet::build_tapbranch(jet::tapleaf_hash(), remaining_debt_slot_leaf);
+
+    // Compute a TapTweak
+    let bip0341_key: u256 = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let tweaked_key: u256 = jet::build_taptweak(bip0341_key, tap_node);
+
+    // Turn the TapTweak into a script hash
+    let hash_ctx1: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx2: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx1, 0x5120); // Segwit v1, length 32
+    let hash_ctx3: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx2, tweaked_key);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx3)
+}
+
+// Economics
+
+// Collateral unlocked once `paid_debt` of BUYBACK_AMOUNT has been paid.
+fn get_unlocked_collateral(paid_debt: u64) -> u64 {
+    mul_div(paid_debt, param::COLLATERAL_AMOUNT, param::BUYBACK_AMOUNT)
+}
+
+// Collateral the covenant must still hold at `remaining_debt`.
+fn get_remaining_collateral(remaining_debt: u64) -> u64 {
+    let paid_debt: u64 = safe_sub_64(param::BUYBACK_AMOUNT, remaining_debt);
+
+    safe_sub_64(param::COLLATERAL_AMOUNT, get_unlocked_collateral(paid_debt))
+}
+
+fn validate_position_input(input_index: u32, current_debt: u64) {
+    ensure_input_script_hash(input_index, get_script_hash_for_storage(current_debt));
+    ensure_input_asset_and_amount(
+        input_index,
+        param::COLLATERAL_ASSET_ID,
+        get_remaining_collateral(current_debt)
+    );
+}
+
+// Exercise (buyback) flow
+//
+// inputs : 0 borrower NFT, 1 position (this covenant)
+// outputs: partial — 0 borrower NFT, 1 position (new state), 2 lender payout
+//          full    — 0 borrower NFT burn (OP_RETURN), 1 lender payout
+// The collateral that is released is unconstrained (the borrower signs).
+
+fn exercise(current_debt: u64, amount: u64) {
+    let (borrower_nft_input_index, borrower_nft_output_index): (u32, u32) = (0, 0);
+    let position_input_index: u32 = 1;
+    let position_output_index: u32 = 1;
+
+    assert!(jet::eq_32(jet::current_index(), position_input_index));
+
+    assert!(jet::some_64(amount));
+    assert!(jet::le_64(amount, current_debt));
+
+    validate_position_input(position_input_index, current_debt);
+
+    let new_debt: u64 = safe_sub_64(current_debt, amount);
+    let is_partial: bool = jet::some_64(new_debt);
+
+    match is_partial {
+        true => {
+            ensure_io_asset_and_amount_eq(
+                borrower_nft_input_index,
+                borrower_nft_output_index,
+                param::BORROWER_NFT_ASSET_ID,
+                1
+            );
+
+            ensure_output_asset_and_amount(
+                position_output_index,
+                param::COLLATERAL_ASSET_ID,
+                get_remaining_collateral(new_debt)
+            );
+            ensure_output_script_hash(position_output_index, get_script_hash_for_storage(new_debt));
+        },
+        false => {
+            ensure_input_asset_and_amount_burn(
+                borrower_nft_input_index,
+                borrower_nft_output_index,
+                param::BORROWER_NFT_ASSET_ID,
+                1
+            );
+        },
+    };
+
+    let lender_payout_output_index: u32 = match is_partial {
+        true => 2,
+        false => 1,
+    };
+
+    ensure_output_asset_and_amount(lender_payout_output_index, param::CASH_ASSET_ID, amount);
+    ensure_output_script_hash(lender_payout_output_index, param::LENDER_PAYOUT_SCRIPT_HASH);
+}
+
+// Lapse flow
+//
+// inputs : 0 position (this covenant), 1 lender NFT
+// outputs: 0 lender NFT burn (OP_RETURN)
+// The remaining collateral is unconstrained (the lender signs).
+
+fn lapse(current_debt: u64) {
+    let position_input_index: u32 = 0;
+    let (lender_nft_input_index, lender_nft_output_index): (u32, u32) = (1, 0);
+
+    assert!(jet::eq_32(jet::current_index(), position_input_index));
+
+    jet::check_lock_height(param::EXPIRY_HEIGHT);
+
+    validate_position_input(position_input_index, current_debt);
+
+    ensure_input_asset_and_amount_burn(
+        lender_nft_input_index,
+        lender_nft_output_index,
+        param::LENDER_NFT_ASSET_ID,
+        1
+    );
+}
+
+fn main() {
+    match witness::PATH {
+        Left(exercise_params: (u64, u64)) => {
+            let (current_debt, amount): (u64, u64) = exercise_params;
+
+            exercise(current_debt, amount);
+        },
+        Right(current_debt: u64) => {
+            lapse(current_debt);
+        },
+    }
+}
