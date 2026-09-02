@@ -11,7 +11,10 @@ mod params;
 mod terms;
 mod witness;
 
-pub use core::{SwaptionPosition, SwaptionPositionStorage, script_hash};
+pub use core::{
+    FILL_BORROWER_NFT_OUTPUT_INDEX, FILL_LENDER_NFT_OUTPUT_INDEX, FILL_METADATA_OUTPUT_INDEX, FILL_POSITION_OUTPUT_INDEX, SwaptionPosition,
+    SwaptionPositionStorage, script_hash,
+};
 pub use error::SwaptionPositionError;
 pub use metadata::SwaptionPositionCreationMetadata;
 pub use params::SwaptionPositionParameters;
