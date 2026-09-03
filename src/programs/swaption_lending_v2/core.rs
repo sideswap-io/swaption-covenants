@@ -218,6 +218,13 @@ mod tests {
     #[test]
     fn print_program_leaf() {
         println!("SWAPTION_LENDING_V2_LEAF={}", hex::encode(tapleaf_hash_of_program()));
+        // A vector for the SDK's hash-only reconstruction: the test params
+        // at full debt and at debt 7.
+        let p = params();
+        println!("V2_VECTOR_DIGEST={}", hex::encode(p.digest()));
+        for debt in [3_100_000_000_000u64, 7] {
+            println!("V2_VECTOR_SCRIPT_{debt}={}", hex::encode(SwaptionPositionV2::new(p, debt).get_script_pubkey().as_bytes()));
+        }
     }
 
     /// The hash-only reconstruction must land on Simplex's script for the
