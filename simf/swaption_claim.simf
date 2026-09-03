@@ -1,0 +1,46 @@
+// Swaption claim — a token-gated coin.
+//
+// Whoever spends one unit of the lender token as INPUT 0 of the transaction
+// may spend this coin however they like. Nothing is baked into the program:
+// the token id travels in the witness and is bound to the coin through
+// taproot storage slot 0, so the CMR is a constant and anyone can derive the
+// claim script of a token from hashes alone.
+//
+// A Swaption lending position pays its exercise cash and its lapsed
+// collateral to the claim script of the lender token, so the lender's whole
+// claim moves with the token and the token can be sold.
+
+fn get_script_hash_for_storage(lender_nft: u256) -> u256 {
+    let slot_ctx1: Ctx8 = jet::tapdata_init();
+    let slot_ctx2: Ctx8 = jet::sha_256_ctx_8_add_32(slot_ctx1, lender_nft);
+    let slot_leaf: u256 = jet::sha_256_ctx_8_finalize(slot_ctx2);
+
+    let tap_node: u256 = jet::build_tapbranch(jet::tapleaf_hash(), slot_leaf);
+
+    // Compute a TapTweak
+    let bip0341_key: u256 = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let tweaked_key: u256 = jet::build_taptweak(bip0341_key, tap_node);
+
+    // Turn the TapTweak into a script hash
+    let hash_ctx1: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx2: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx1, 0x5120); // Segwit v1, length 32
+    let hash_ctx3: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx2, tweaked_key);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx3)
+}
+
+fn main() {
+    let lender_nft: u256 = witness::LENDER_NFT;
+
+    // The witness must name the token this coin was bound to.
+    assert!(jet::eq_256(jet::current_script_hash(), get_script_hash_for_storage(lender_nft)));
+
+    // Input 0 must be one explicit unit of that token. The holder signs it.
+    let pair: (Asset1, Amount1) = unwrap(jet::input_amount(0));
+    let (asset, amount): (Asset1, Amount1) = pair;
+    let asset_bits: u256 = unwrap_right::<(u1, u256)>(asset);
+    let amount: u64 = unwrap_right::<(u1, u256)>(amount);
+
+    assert!(jet::eq_256(asset_bits, lender_nft));
+    assert!(jet::eq_64(amount, 1));
+}

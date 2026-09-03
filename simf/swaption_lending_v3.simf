@@ -1,0 +1,336 @@
+// Swaption lending v3 — a sale with a buyback right, ONE program for every
+// position. Same as v2 except the lapse: after expiry ANYONE may sweep the
+// remaining collateral, but only to the lender's payout script, so the
+// lender never has to act and a token-gated payout script (swaption_claim)
+// makes the lender side transferable.
+//
+// The borrower has sold `collateral_amount` of `collateral_asset` to the
+// lender and holds the right to buy it back for `buyback_amount` of
+// `cash_asset` at any time before `expiry_height` (a fully collateralised
+// American call). The coin sits in this covenant; the roles are two
+// one-unit NFTs.
+//
+// Nothing is baked into the program. The TERMS travel in the witness and
+// are bound to the coin through taproot storage slot 0 (a SHA-256 digest of
+// the terms); slot 1 is the remaining debt. So the CMR is a constant, a
+// wallet can rebuild the position script from the terms it was shown with
+// hashes alone, and an indexer recognises positions by CMR.
+//
+// Terms (witness, in this order, also the digest preimage, big-endian):
+//   collateral_asset u256 · cash_asset u256 · collateral_amount u64 ·
+//   buyback_amount u64 · expiry_height u32 · borrower_nft u256 ·
+//   lender_nft u256 · lender_payout_script_hash u256
+//
+// Paths:
+//   exercise(terms, current_debt, amount)  borrower pays `amount` of cash to
+//                                          the lender's script and unlocks
+//                                          collateral proportionally
+//   lapse(terms, current_debt)             after expiry anyone may pay the
+//                                          remaining collateral to the
+//                                          lender's script
+//
+// Forked from BlockstreamResearch/simplicity-lending lending.simf
+// (MIT OR Apache-2.0). Removed: pending state, accept, cancel, vaults,
+// protocol fee. Fixed: remaining collateral is derived from cumulative paid
+// debt (the reference subtracts per-step floors, which drifts after two
+// partial repayments).
+
+type Terms = (u256, u256, u64, u64, u32, u256, u256, u256);
+
+// Helper getters
+
+fn get_script_hash(index: u32, is_input_index: bool) -> u256 {
+    let script_hash: u256 = match is_input_index {
+        true => unwrap(jet::input_script_hash(index)),
+        false => unwrap(jet::output_script_hash(index)),
+    };
+
+    script_hash
+}
+
+fn get_explicit_asset_and_amount(index: u32, is_input_index: bool) -> (u256, u64) {
+    let pair: (Asset1, Amount1) = match is_input_index {
+        true => unwrap(jet::input_amount(index)),
+        false => unwrap(jet::output_amount(index)),
+    };
+    let (asset, amount): (Asset1, Amount1) = pair;
+    let asset_bits: u256 = unwrap_right::<(u1, u256)>(asset);
+    let amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (asset_bits, amount)
+}
+
+fn is_op_return(output_index: u32) -> bool {
+    match jet::output_null_datum(output_index, 0) {
+        Some(entry: Option<Either<(u2, u256), Either<u1, u4>>>) => true,
+        None => false,
+    }
+}
+
+// Check helpers
+
+fn check_asset_amounts_eq(asset_amount_1: u64, asset_amount_2: u64) {
+    assert!(jet::eq_64(asset_amount_1, asset_amount_2));
+}
+
+fn check_assets_eq(asset_bits_1: u256, asset_bits_2: u256) {
+    assert!(jet::eq_256(asset_bits_1, asset_bits_2));
+}
+
+fn check_script_hashes_eq(script_1: u256, script_2: u256) {
+    assert!(jet::eq_256(script_1, script_2));
+}
+
+fn check_flags_eq(flag_1: bool, flag_2: bool) {
+    assert!(jet::eq_1(<bool>::into(flag_1), <bool>::into(flag_2)));
+}
+
+// Math helpers
+
+fn safe_sub_64(first: u64, second: u64) -> u64 {
+    let (carry, result): (bool, u64) = jet::subtract_64(first, second);
+
+    check_flags_eq(carry, false);
+
+    result
+}
+
+fn mul_div(x: u64, y: u64, denominator: u64) -> u64 {
+    let product: u128 = jet::multiply_64(x, y);
+
+    let (hi, lo): (u64, u64) = <u128>::into(product);
+    check_asset_amounts_eq(hi, 0);
+
+    let result: u64 = jet::divide_64(lo, denominator);
+
+    result
+}
+
+// Ensure functions
+
+fn ensure_output_is_op_return(index: u32) {
+    check_flags_eq(is_op_return(index), true);
+}
+
+fn ensure_input_script_hash(input_index: u32, expected_script_hash: u256) {
+    let script_hash: u256 = get_script_hash(input_index, true);
+
+    check_script_hashes_eq(script_hash, expected_script_hash);
+}
+
+fn ensure_output_script_hash(output_index: u32, expected_script_hash: u256) {
+    let script_hash: u256 = get_script_hash(output_index, false);
+
+    check_script_hashes_eq(script_hash, expected_script_hash);
+}
+
+fn ensure_input_asset_and_amount(input_index: u32, expected_asset_bits: u256, expected_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(input_index, true);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    check_asset_amounts_eq(amount, expected_amount);
+}
+
+fn ensure_output_asset_and_amount(output_index: u32, expected_asset_bits: u256, expected_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(output_index, false);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    check_asset_amounts_eq(amount, expected_amount);
+}
+
+fn ensure_io_asset_and_amount_eq(
+    input_index: u32,
+    output_index: u32,
+    expected_asset_bits: u256,
+    expected_amount: u64
+) {
+    ensure_input_asset_and_amount(input_index, expected_asset_bits, expected_amount);
+    ensure_output_asset_and_amount(output_index, expected_asset_bits, expected_amount);
+}
+
+fn ensure_input_asset_and_amount_burn(
+    input_index: u32,
+    output_index: u32,
+    expected_asset_bits: u256,
+    expected_asset_amount: u64
+) {
+    ensure_io_asset_and_amount_eq(input_index, output_index, expected_asset_bits, expected_asset_amount);
+
+    ensure_output_is_op_return(output_index);
+}
+
+// Terms
+
+fn terms_digest(terms: Terms) -> u256 {
+    let (collateral_asset, cash_asset, collateral_amount, buyback_amount, expiry_height, borrower_nft, lender_nft, payout_hash): Terms = terms;
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, collateral_asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, cash_asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, collateral_amount);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, buyback_amount);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, expiry_height);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, borrower_nft);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, lender_nft);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, payout_hash);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+// Storage: slot 0 = terms digest, slot 1 = remaining_debt
+
+fn get_terms_slot_leaf(digest: u256) -> u256 {
+    let state_ctx1: Ctx8 = jet::tapdata_init();
+    let state_ctx2: Ctx8 = jet::sha_256_ctx_8_add_32(state_ctx1, digest);
+
+    jet::sha_256_ctx_8_finalize(state_ctx2)
+}
+
+fn get_remaining_debt_slot_leaf(remaining_debt: u64) -> u256 {
+    let remaining_debt: u256 = <(u128, u128)>::into((0, <(u64, u64)>::into((0, remaining_debt))));
+
+    let state_ctx1: Ctx8 = jet::tapdata_init();
+    let state_ctx2: Ctx8 = jet::sha_256_ctx_8_add_32(state_ctx1, remaining_debt);
+
+    jet::sha_256_ctx_8_finalize(state_ctx2)
+}
+
+fn get_script_hash_for_storage(digest: u256, remaining_debt: u64) -> u256 {
+    let terms_slot_leaf: u256 = get_terms_slot_leaf(digest);
+    let remaining_debt_slot_leaf: u256 = get_remaining_debt_slot_leaf(remaining_debt);
+
+    let first_tap_node: u256 = jet::build_tapbranch(jet::tapleaf_hash(), terms_slot_leaf);
+    let tap_node: u256 = jet::build_tapbranch(first_tap_node, remaining_debt_slot_leaf);
+
+    // Compute a TapTweak
+    let bip0341_key: u256 = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let tweaked_key: u256 = jet::build_taptweak(bip0341_key, tap_node);
+
+    // Turn the TapTweak into a script hash
+    let hash_ctx1: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx2: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx1, 0x5120); // Segwit v1, length 32
+    let hash_ctx3: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx2, tweaked_key);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx3)
+}
+
+// Economics
+
+// Collateral unlocked once `paid_debt` of `buyback_amount` has been paid.
+fn get_unlocked_collateral(paid_debt: u64, collateral_amount: u64, buyback_amount: u64) -> u64 {
+    mul_div(paid_debt, collateral_amount, buyback_amount)
+}
+
+// Collateral the covenant must still hold at `remaining_debt`.
+fn get_remaining_collateral(remaining_debt: u64, collateral_amount: u64, buyback_amount: u64) -> u64 {
+    let paid_debt: u64 = safe_sub_64(buyback_amount, remaining_debt);
+
+    safe_sub_64(collateral_amount, get_unlocked_collateral(paid_debt, collateral_amount, buyback_amount))
+}
+
+fn validate_position_input(input_index: u32, digest: u256, terms: Terms, current_debt: u64) {
+    let (collateral_asset, cash_asset, collateral_amount, buyback_amount, expiry_height, borrower_nft, lender_nft, payout_hash): Terms = terms;
+    ensure_input_script_hash(input_index, get_script_hash_for_storage(digest, current_debt));
+    ensure_input_asset_and_amount(
+        input_index,
+        collateral_asset,
+        get_remaining_collateral(current_debt, collateral_amount, buyback_amount)
+    );
+}
+
+// Exercise (buyback) flow
+//
+// inputs : 0 borrower NFT, 1 position (this covenant)
+// outputs: partial — 0 borrower NFT, 1 position (new state), 2 lender payout
+//          full    — 0 borrower NFT burn (OP_RETURN), 1 lender payout
+// The collateral that is released is unconstrained (the borrower signs).
+
+fn exercise(terms: Terms, current_debt: u64, amount: u64) {
+    let (collateral_asset, cash_asset, collateral_amount, buyback_amount, expiry_height, borrower_nft, lender_nft, payout_hash): Terms = terms;
+    let digest: u256 = terms_digest(terms);
+    let (borrower_nft_input_index, borrower_nft_output_index): (u32, u32) = (0, 0);
+    let position_input_index: u32 = 1;
+    let position_output_index: u32 = 1;
+
+    assert!(jet::eq_32(jet::current_index(), position_input_index));
+
+    assert!(jet::some_64(amount));
+    assert!(jet::le_64(amount, current_debt));
+
+    validate_position_input(position_input_index, digest, terms, current_debt);
+
+    let new_debt: u64 = safe_sub_64(current_debt, amount);
+    let is_partial: bool = jet::some_64(new_debt);
+
+    match is_partial {
+        true => {
+            ensure_io_asset_and_amount_eq(
+                borrower_nft_input_index,
+                borrower_nft_output_index,
+                borrower_nft,
+                1
+            );
+
+            ensure_output_asset_and_amount(
+                position_output_index,
+                collateral_asset,
+                get_remaining_collateral(new_debt, collateral_amount, buyback_amount)
+            );
+            ensure_output_script_hash(position_output_index, get_script_hash_for_storage(digest, new_debt));
+        },
+        false => {
+            ensure_input_asset_and_amount_burn(
+                borrower_nft_input_index,
+                borrower_nft_output_index,
+                borrower_nft,
+                1
+            );
+        },
+    };
+
+    let lender_payout_output_index: u32 = match is_partial {
+        true => 2,
+        false => 1,
+    };
+
+    ensure_output_asset_and_amount(lender_payout_output_index, cash_asset, amount);
+    ensure_output_script_hash(lender_payout_output_index, payout_hash);
+}
+
+// Lapse flow
+//
+// inputs : 0 position (this covenant); anything else is the sweeper's
+// outputs: 0 the remaining collateral, in full, to the lender's script
+// Nobody's token is needed: the destination is fixed, so anyone may sweep.
+
+fn lapse(terms: Terms, current_debt: u64) {
+    let (collateral_asset, cash_asset, collateral_amount, buyback_amount, expiry_height, borrower_nft, lender_nft, payout_hash): Terms = terms;
+    let digest: u256 = terms_digest(terms);
+    let position_input_index: u32 = 0;
+    let lender_payout_output_index: u32 = 0;
+
+    assert!(jet::eq_32(jet::current_index(), position_input_index));
+
+    jet::check_lock_height(expiry_height);
+
+    validate_position_input(position_input_index, digest, terms, current_debt);
+
+    ensure_output_asset_and_amount(
+        lender_payout_output_index,
+        collateral_asset,
+        get_remaining_collateral(current_debt, collateral_amount, buyback_amount)
+    );
+    ensure_output_script_hash(lender_payout_output_index, payout_hash);
+}
+
+fn main() {
+    match witness::PATH {
+        Left(exercise_params: (Terms, u64, u64)) => {
+            let (terms, current_debt, amount): (Terms, u64, u64) = exercise_params;
+
+            exercise(terms, current_debt, amount);
+        },
+        Right(lapse_params: (Terms, u64)) => {
+            let (terms, current_debt): (Terms, u64) = lapse_params;
+
+            lapse(terms, current_debt);
+        },
+    }
+}
