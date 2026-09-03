@@ -5,3 +5,4 @@ pub mod lending;
 pub mod program;
 pub mod script_auth;
 pub mod swaption_lending;
+pub mod swaption_lending_v2;
