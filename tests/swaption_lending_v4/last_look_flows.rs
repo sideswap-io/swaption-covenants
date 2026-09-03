@@ -43,7 +43,8 @@ fn last_look_tx(context: &simplex::TestContext, fill: &Fill, borrower_payment: u
     ft.add_input(PartialInput::new(cash_utxo), RequiredSignature::NativeEcdsa);
     // The venue takes the collateral and its fee coin back.
     ft.add_output(PartialOutput::new(fill.venue.get_address().script_pubkey(), fill.position.get_remaining_collateral(), params.collateral_asset_id));
-    ft.add_output(PartialOutput::new(fill.venue.get_address().script_pubkey(), venue_lbtc.explicit_amount(), params.collateral_asset_id));
+    // Leave 1000 sats of the venue coin for the network fee.
+    ft.add_output(PartialOutput::new(fill.venue.get_address().script_pubkey(), venue_lbtc.explicit_amount() - 1000, params.collateral_asset_id));
     if borrower_payment > 0 {
         ft.add_output(PartialOutput::new(context.get_default_signer().get_address().script_pubkey(), borrower_payment, params.cash_asset_id));
     }
