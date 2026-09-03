@@ -7,4 +7,5 @@ pub mod script_auth;
 pub mod swaption_lending;
 pub mod swaption_lending_v2;
 pub mod swaption_lending_v3;
+pub mod swaption_lending_v4;
 pub mod swaption_claim;
