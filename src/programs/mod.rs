@@ -10,3 +10,4 @@ pub mod swaption_lending_v3;
 pub mod swaption_lending_v4;
 pub mod swaption_lending_v5;
 pub mod swaption_claim;
+pub mod swaption_offer;

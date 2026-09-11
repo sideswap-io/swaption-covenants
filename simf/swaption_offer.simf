@@ -1,0 +1,451 @@
+// Swaption offer v1 — a lender's cash escrowed in a covenant, DRAFT.
+//
+// STATUS 2026-09-10: written on the laptop (no Simplex toolchain there), NOT
+// yet compiled or run on regtest. Build brief: Dropbox
+// Swaption/Lending/13 Escrowed lend offers — design brief and fee decisions.
+// First step on scott-mcp: `simplex build`, then the regtest scenarios listed
+// in the brief (§3) under tests/swaption_offer/.
+//
+// A lender locks cash in this coin at post time. Any borrower may fill it by
+// creating a v5 position (swaption_lending_v5.simf) that this program checks
+// term by term, so a fill needs only the borrower's signature: the lender is
+// never asked to sign a transaction it did not start. Partial fills continue
+// the coin with the remaining cash, like a v5 last-look round continues a
+// position. The lender withdraws by spending one unit of its lender token as
+// input 0 (the claim covenant's pattern); after `cutoff_height` anyone may
+// return the cash to the lender's claim script (the venue sweeps).
+//
+// Nothing is baked into the program. The TERMS travel in the witness and are
+// bound to the coin through taproot storage slot 0 (a SHA-256 digest of the
+// terms); slot 1 is the remaining cash. So the CMR is a constant, a wallet
+// can rebuild the offer script from the terms it was shown with hashes alone,
+// and an indexer recognises offers by CMR.
+//
+// Offer terms (witness, in this order, also the digest preimage, big-endian):
+//   cash_asset u256 · lender_token u256 · claim_hash u256 · fee_hash u256 ·
+//   position_leaf u256 · fee_min u64 · cutoff_height u32 · rows (4 ×)
+// Row: collateral_asset u256 · expiry_height u32 · price_out u64 ·
+//      buyback_price u64 · fee_per_unit u64 · min_size u64
+//   (an unused row is all zero; expiry_height == 0 cannot be selected)
+//
+//   cash_asset     the escrowed asset (a Liquid output holds one asset)
+//   lender_token   the wallet's lender token: cancel authority, and the
+//                  `lender_nft` term of every position this offer creates
+//   claim_hash     script hash of the claim covenant bound to lender_token:
+//                  every position's payout, leftovers, expired cash
+//   fee_hash       script hash of the venue fee script
+//   position_leaf  tapleaf hash of the position program (v5); the wallet
+//                  checks it against the program it knows when it funds
+//   fee_min        minimum venue fee per fill (cash sats)
+//   cutoff_height  from here anyone may return the cash to claim_hash
+//   price_out      cash sats released per whole unit of collateral (the sale
+//                  price plus the lender's venue fee per unit)
+//   buyback_price  cash sats per whole unit the borrower must owe, at least
+//   fee_per_unit   venue fee per whole unit of collateral (both sides)
+//   min_size       smallest fill, collateral sats
+//
+// Paths:
+//   fill(terms, remaining, args)   a borrower puts up `n` of a row's
+//                                  collateral into a v5 position and takes
+//                                  n × price_out of the cash (less the fee)
+//   cancel(terms, remaining)       input 0 is one unit of lender_token: the
+//                                  holder takes the cash wherever it likes
+//   expire(terms, remaining)       after cutoff_height, all the cash to
+//                                  claim_hash; anyone may build it
+//
+// Helpers and the storage construction are copied from swaption_lending_v5.simf
+// so the two programs compute identical script hashes.
+
+type Row = (u256, u32, u64, u64, u64, u64);
+type Rows = (Row, Row, Row, Row);
+type OfferTerms = (u256, u256, u256, u256, u256, u64, u32, Rows);
+
+// The v5 position terms, in the position program's order.
+type PositionTerms = (u256, u256, u64, u64, u32, u256, u256, u256, u256, u256, u32);
+
+// Fill arguments: row selector (hi, lo), n, buyback_amount, borrower_nft,
+// borrower_payout_hash, last_look_hash, last_look_height.
+type FillArgs = ((bool, bool), u64, u64, u256, u256, u256, u32);
+
+// Helper getters
+
+fn get_script_hash(index: u32, is_input_index: bool) -> u256 {
+    let script_hash: u256 = match is_input_index {
+        true => unwrap(jet::input_script_hash(index)),
+        false => unwrap(jet::output_script_hash(index)),
+    };
+
+    script_hash
+}
+
+fn get_explicit_asset_and_amount(index: u32, is_input_index: bool) -> (u256, u64) {
+    let pair: (Asset1, Amount1) = match is_input_index {
+        true => unwrap(jet::input_amount(index)),
+        false => unwrap(jet::output_amount(index)),
+    };
+    let (asset, amount): (Asset1, Amount1) = pair;
+    let asset_bits: u256 = unwrap_right::<(u1, u256)>(asset);
+    let amount: u64 = unwrap_right::<(u1, u256)>(amount);
+    (asset_bits, amount)
+}
+
+// Check helpers
+
+fn check_asset_amounts_eq(asset_amount_1: u64, asset_amount_2: u64) {
+    assert!(jet::eq_64(asset_amount_1, asset_amount_2));
+}
+
+fn check_assets_eq(asset_bits_1: u256, asset_bits_2: u256) {
+    assert!(jet::eq_256(asset_bits_1, asset_bits_2));
+}
+
+fn check_script_hashes_eq(script_1: u256, script_2: u256) {
+    assert!(jet::eq_256(script_1, script_2));
+}
+
+fn check_flags_eq(flag_1: bool, flag_2: bool) {
+    assert!(jet::eq_1(<bool>::into(flag_1), <bool>::into(flag_2)));
+}
+
+// Math helpers
+
+fn safe_sub_64(first: u64, second: u64) -> u64 {
+    let (carry, result): (bool, u64) = jet::subtract_64(first, second);
+
+    check_flags_eq(carry, false);
+
+    result
+}
+
+fn mul_div(x: u64, y: u64, denominator: u64) -> u64 {
+    let product: u128 = jet::multiply_64(x, y);
+
+    let (hi, lo): (u64, u64) = <u128>::into(product);
+    check_asset_amounts_eq(hi, 0);
+
+    let result: u64 = jet::divide_64(lo, denominator);
+
+    result
+}
+
+// a ≥ b
+fn max_64(a: u64, b: u64) -> u64 {
+    let a_is_smaller: bool = jet::lt_64(a, b);
+    let result: u64 = match a_is_smaller {
+        true => b,
+        false => a,
+    };
+
+    result
+}
+
+// Ensure functions
+
+fn ensure_input_script_hash(input_index: u32, expected_script_hash: u256) {
+    let script_hash: u256 = get_script_hash(input_index, true);
+
+    check_script_hashes_eq(script_hash, expected_script_hash);
+}
+
+fn ensure_output_script_hash(output_index: u32, expected_script_hash: u256) {
+    let script_hash: u256 = get_script_hash(output_index, false);
+
+    check_script_hashes_eq(script_hash, expected_script_hash);
+}
+
+fn ensure_input_asset_and_amount(input_index: u32, expected_asset_bits: u256, expected_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(input_index, true);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    check_asset_amounts_eq(amount, expected_amount);
+}
+
+fn ensure_output_asset_and_amount(output_index: u32, expected_asset_bits: u256, expected_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(output_index, false);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    check_asset_amounts_eq(amount, expected_amount);
+}
+
+// The output must carry at least `min_amount` of the asset (the fee check).
+fn ensure_output_asset_and_min_amount(output_index: u32, expected_asset_bits: u256, min_amount: u64) {
+    let (asset_bits, amount): (u256, u64) = get_explicit_asset_and_amount(output_index, false);
+
+    check_assets_eq(asset_bits, expected_asset_bits);
+    assert!(jet::le_64(min_amount, amount));
+}
+
+// Terms
+
+fn add_row(ctx: Ctx8, row: Row) -> Ctx8 {
+    let (collateral_asset, expiry_height, price_out, buyback_price, fee_per_unit, min_size): Row = row;
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, collateral_asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, expiry_height);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, price_out);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, buyback_price);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, fee_per_unit);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, min_size);
+    ctx
+}
+
+fn offer_digest(terms: OfferTerms) -> u256 {
+    let (cash_asset, lender_token, claim_hash, fee_hash, position_leaf, fee_min, cutoff_height, rows): OfferTerms = terms;
+    let (row0, row1, row2, row3): Rows = rows;
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, cash_asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, lender_token);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, claim_hash);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, fee_hash);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, position_leaf);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, fee_min);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, cutoff_height);
+    let ctx: Ctx8 = add_row(ctx, row0);
+    let ctx: Ctx8 = add_row(ctx, row1);
+    let ctx: Ctx8 = add_row(ctx, row2);
+    let ctx: Ctx8 = add_row(ctx, row3);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+// Exactly swaption_lending_v5.simf's terms_digest, so the position script this
+// program demands is the one the position program recomputes for itself.
+fn position_digest(terms: PositionTerms) -> u256 {
+    let (collateral_asset, cash_asset, collateral_amount, buyback_amount, expiry_height, borrower_nft, lender_nft, payout_hash, borrower_payout_hash, last_look_hash, last_look_height): PositionTerms = terms;
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, collateral_asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, cash_asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, collateral_amount);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, buyback_amount);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, expiry_height);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, borrower_nft);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, lender_nft);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, payout_hash);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, borrower_payout_hash);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, last_look_hash);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, last_look_height);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+fn select_row(rows: Rows, selector: (bool, bool)) -> Row {
+    let (row0, row1, row2, row3): Rows = rows;
+    let (hi, lo): (bool, bool) = selector;
+    let row: Row = match hi {
+        true => match lo {
+            true => row3,
+            false => row2,
+        },
+        false => match lo {
+            true => row1,
+            false => row0,
+        },
+    };
+
+    row
+}
+
+// Storage: slot 0 = terms digest, slot 1 = a u64 state (remaining cash here,
+// remaining debt in the position program) — the same two-leaf construction
+// as swaption_lending_v5.simf, parameterised by the program leaf.
+
+fn get_digest_slot_leaf(digest: u256) -> u256 {
+    let state_ctx1: Ctx8 = jet::tapdata_init();
+    let state_ctx2: Ctx8 = jet::sha_256_ctx_8_add_32(state_ctx1, digest);
+
+    jet::sha_256_ctx_8_finalize(state_ctx2)
+}
+
+fn get_u64_slot_leaf(value: u64) -> u256 {
+    let value: u256 = <(u128, u128)>::into((0, <(u64, u64)>::into((0, value))));
+
+    let state_ctx1: Ctx8 = jet::tapdata_init();
+    let state_ctx2: Ctx8 = jet::sha_256_ctx_8_add_32(state_ctx1, value);
+
+    jet::sha_256_ctx_8_finalize(state_ctx2)
+}
+
+fn script_hash_for_leaf_and_storage(program_leaf: u256, digest: u256, state: u64) -> u256 {
+    let digest_slot_leaf: u256 = get_digest_slot_leaf(digest);
+    let state_slot_leaf: u256 = get_u64_slot_leaf(state);
+
+    let first_tap_node: u256 = jet::build_tapbranch(program_leaf, digest_slot_leaf);
+    let tap_node: u256 = jet::build_tapbranch(first_tap_node, state_slot_leaf);
+
+    // Compute a TapTweak
+    let bip0340_key: u256 = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let tweaked_key: u256 = jet::build_taptweak(bip0340_key, tap_node);
+
+    // Turn the TapTweak into a script hash
+    let hash_ctx1: Ctx8 = jet::sha_256_ctx_8_init();
+    let hash_ctx2: Ctx8 = jet::sha_256_ctx_8_add_2(hash_ctx1, 0x5120); // Segwit v1, length 32
+    let hash_ctx3: Ctx8 = jet::sha_256_ctx_8_add_32(hash_ctx2, tweaked_key);
+
+    jet::sha_256_ctx_8_finalize(hash_ctx3)
+}
+
+// This program's own script for a digest and a remaining amount.
+fn get_offer_script_hash(digest: u256, remaining: u64) -> u256 {
+    script_hash_for_leaf_and_storage(jet::tapleaf_hash(), digest, remaining)
+}
+
+// The coin at `input_index` must be this offer with these terms and this
+// much cash left. Every path starts here, so the witness cannot claim terms
+// the coin was not bound to.
+fn validate_offer_input(input_index: u32, terms: OfferTerms, digest: u256, remaining: u64) {
+    let (cash_asset, lender_token, claim_hash, fee_hash, position_leaf, fee_min, cutoff_height, rows): OfferTerms = terms;
+    ensure_input_script_hash(input_index, get_offer_script_hash(digest, remaining));
+    ensure_input_asset_and_amount(input_index, cash_asset, remaining);
+}
+
+// Fill flow
+//
+// inputs : 0 this offer, 1 the borrower token, 2 the venue's fee coin,
+//          3.. the borrower's collateral (wallet-added); only 0 is checked
+// outputs: 0 the v5 position (n of the row's collateral, debt = buyback_amount)
+//          1 the borrower token (unchecked: the borrower's wallet verifies it)
+//          2 rest ≥ one minimum fill — this offer again, with `rest`
+//            0 < rest < one minimum fill — `rest` to claim_hash (leftover)
+//            rest == 0 — absent; the fee output moves up to index 2
+//          fee: at least fee_due of the cash to fee_hash (index 3, or 2)
+//          everything else (proceeds, changes, network fee) is unconstrained
+
+fn fill(terms: OfferTerms, remaining: u64, args: FillArgs) {
+    let (cash_asset, lender_token, claim_hash, fee_hash, position_leaf, fee_min, cutoff_height, rows): OfferTerms = terms;
+    let (selector, n, buyback_amount, borrower_nft, borrower_payout_hash, last_look_hash, last_look_height): FillArgs = args;
+    let digest: u256 = offer_digest(terms);
+    let offer_input_index: u32 = 0;
+    let position_output_index: u32 = 0;
+    let rest_output_index: u32 = 2;
+    let scale: u64 = 100000000;
+
+    assert!(jet::eq_32(jet::current_index(), offer_input_index));
+
+    validate_offer_input(offer_input_index, terms, digest, remaining);
+
+    let row: Row = select_row(rows, selector);
+    let (collateral_asset, expiry_height, price_out, buyback_price, fee_per_unit, min_size): Row = row;
+
+    // A zero row is not selectable; a minimum fill must be worth something.
+    assert!(jet::some_32(expiry_height));
+    let min_cash: u64 = mul_div(min_size, price_out, scale);
+    assert!(jet::some_64(min_cash));
+
+    // Size, cash out, what is left.
+    assert!(jet::le_64(min_size, n));
+    let out: u64 = mul_div(n, price_out, scale);
+    let rest: u64 = safe_sub_64(remaining, out);
+
+    // The borrower must owe at least the row's buyback for n (a higher
+    // buyback never hurts the lender).
+    let buyback_floor: u64 = mul_div(n, buyback_price, scale);
+    assert!(jet::le_64(buyback_floor, buyback_amount));
+
+    // The position: the v5 program with these terms and a full debt.
+    let position_terms: PositionTerms = (
+        collateral_asset,
+        cash_asset,
+        n,
+        buyback_amount,
+        expiry_height,
+        borrower_nft,
+        lender_token,
+        claim_hash,
+        borrower_payout_hash,
+        last_look_hash,
+        last_look_height,
+    );
+    let position_script_hash: u256 = script_hash_for_leaf_and_storage(position_leaf, position_digest(position_terms), buyback_amount);
+    ensure_output_asset_and_amount(position_output_index, collateral_asset, n);
+    ensure_output_script_hash(position_output_index, position_script_hash);
+
+    // What is left of the cash.
+    let continues: bool = jet::le_64(min_cash, rest);
+    let some_rest: bool = jet::some_64(rest);
+    match continues {
+        true => {
+            ensure_output_asset_and_amount(rest_output_index, cash_asset, rest);
+            ensure_output_script_hash(rest_output_index, get_offer_script_hash(digest, rest));
+        },
+        false => match some_rest {
+            true => {
+                ensure_output_asset_and_amount(rest_output_index, cash_asset, rest);
+                ensure_output_script_hash(rest_output_index, claim_hash);
+            },
+            false => {},
+        },
+    };
+
+    // The venue fee, in the venue's favour, at the venue's script (the
+    // regtest scenario "fee goes elsewhere" caught a first draft that checked
+    // the amount but not the script).
+    let fee_due: u64 = max_64(mul_div(n, fee_per_unit, scale), fee_min);
+    let fee_output_index: u32 = match some_rest {
+        true => 3,
+        false => 2,
+    };
+    ensure_output_asset_and_min_amount(fee_output_index, cash_asset, fee_due);
+    ensure_output_script_hash(fee_output_index, fee_hash);
+}
+
+// Cancel flow
+//
+// inputs : 0 one explicit unit of lender_token (its holder signs it),
+//          1 this offer
+// outputs: unconstrained — the token holder directs the cash
+
+fn cancel(terms: OfferTerms, remaining: u64) {
+    let (cash_asset, lender_token, claim_hash, fee_hash, position_leaf, fee_min, cutoff_height, rows): OfferTerms = terms;
+    let digest: u256 = offer_digest(terms);
+    let token_input_index: u32 = 0;
+    let offer_input_index: u32 = 1;
+
+    assert!(jet::eq_32(jet::current_index(), offer_input_index));
+
+    validate_offer_input(offer_input_index, terms, digest, remaining);
+
+    ensure_input_asset_and_amount(token_input_index, lender_token, 1);
+}
+
+// Expire flow
+//
+// inputs : 0 this offer; anything else is the sweeper's
+// outputs: 0 all the remaining cash to claim_hash
+// Nobody's token is needed: the destination is fixed, so anyone may sweep.
+
+fn expire(terms: OfferTerms, remaining: u64) {
+    let (cash_asset, lender_token, claim_hash, fee_hash, position_leaf, fee_min, cutoff_height, rows): OfferTerms = terms;
+    let digest: u256 = offer_digest(terms);
+    let offer_input_index: u32 = 0;
+    let claim_output_index: u32 = 0;
+
+    assert!(jet::eq_32(jet::current_index(), offer_input_index));
+
+    jet::check_lock_height(cutoff_height);
+
+    validate_offer_input(offer_input_index, terms, digest, remaining);
+
+    ensure_output_asset_and_amount(claim_output_index, cash_asset, remaining);
+    ensure_output_script_hash(claim_output_index, claim_hash);
+}
+
+fn main() {
+    match witness::PATH {
+        Left(fill_params: (OfferTerms, u64, FillArgs)) => {
+            let (terms, remaining, args): (OfferTerms, u64, FillArgs) = fill_params;
+
+            fill(terms, remaining, args);
+        },
+        Right(rest: Either<(OfferTerms, u64), (OfferTerms, u64)>) => {
+            match rest {
+                Left(cancel_params: (OfferTerms, u64)) => {
+                    let (terms, remaining): (OfferTerms, u64) = cancel_params;
+
+                    cancel(terms, remaining);
+                },
+                Right(expire_params: (OfferTerms, u64)) => {
+                    let (terms, remaining): (OfferTerms, u64) = expire_params;
+
+                    expire(terms, remaining);
+                },
+            }
+        },
+    }
+}
