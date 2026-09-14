@@ -111,5 +111,5 @@ reference material copyright Blockstream Research.
 
 ## Security
 
-Found something? Please write to security@sideswap.io before publishing. A
+Found something? Please write to hello@liquidconnect.io before publishing. A
 public review and bounty will be announced before any mainnet deployment.
