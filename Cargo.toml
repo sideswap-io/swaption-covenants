@@ -2,11 +2,11 @@
 name = "lending-contracts"
 version = "0.1.0"
 edition = "2024"
-description = "Simplicity Lending contract"
+description = "Swaption lending covenants on Liquid (Simplicity): sale-with-buyback position, lender claim, escrowed lend offer"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/BlockstreamResearch/simplicity-lending"
+repository = "https://github.com/liquidconnect/swaption-covenants"
 readme = "README.md"
-keywords = ["simplicity", "lending", "liquid", "bitcoin", "elements", "contracts"]
+keywords = ["simplicity", "lending", "liquid", "covenant", "swaption"]
 categories = ["cryptography::cryptocurrencies"]
 
 [features]
@@ -24,10 +24,13 @@ pre_lock = []
 
 [dependencies]
 ring = "0.17.14"
-hex.workspace = true
-thiserror.workspace = true
+hex = "0.4"
+thiserror = "1.0"
 
 smplx-std = "0.0.5"
 
 [dev-dependencies]
 anyhow = "1"
+
+# A repository of its own: not a member of any parent workspace.
+[workspace]
